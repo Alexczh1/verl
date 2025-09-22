@@ -66,7 +66,7 @@ def extract_solution(solution_str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--local_dir', default='/media/volume/MultiAgent/data/numina_cot')
+    parser.add_argument('--local_dir', default='~/data/numina_cot')
     parser.add_argument('--train_start', type=int, default=0)
     parser.add_argument('--train_end', type=int, default=0)
 

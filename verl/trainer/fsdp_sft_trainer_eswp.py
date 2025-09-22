@@ -19,6 +19,7 @@ TODO(zhangchi.usc1992)
 """
 
 import os
+from tracemalloc import start
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -27,11 +28,17 @@ import logging
 import re
 import time
 from contextlib import nullcontext
+import math
+from typing import Iterator, Optional
+from operator import itemgetter
+import numpy as np
 
 import hydra
 import torch
+from torch.utils.data import Dataset
+from torch.utils.data.distributed import DistributedSampler
 import torch.distributed
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
 from torch import nn, optim
@@ -169,11 +176,10 @@ class FSDPSFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(f"Using FSDP rank {rank} and size {world_size} for data distribution")
 
-        # Set pin_memory_device when pin_memory is enabled.
-        device_name = get_device_name()
-
-        self.train_sampler = DistributedSampler(
-            self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True
+        self.train_dataset = IndexDataset(self.train_dataset)
+        loss_ema = np.ones(len(self.train_dataset)) / len(self.train_dataset)
+        self.train_sampler = DistributedAdaOrderPruningSampler(
+            AdaOrderPruningSampler(self.train_dataset, loss_ema, self.config.trainer.prune_ratio)
         )
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
@@ -182,7 +188,6 @@ class FSDPSFTTrainer:
             num_workers=8,
             pin_memory=True,
             drop_last=True,
-            pin_memory_device=device_name,
         )
 
         self.val_sampler = DistributedSampler(
@@ -195,7 +200,6 @@ class FSDPSFTTrainer:
             num_workers=8,
             pin_memory=True,
             drop_last=True,
-            pin_memory_device=device_name,
         )
 
     def _build_model_optimizer(self):
@@ -360,7 +364,8 @@ class FSDPSFTTrainer:
         input_ids = batch["input_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         position_ids = batch["position_ids"].to(self.device_name)
-        loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
+        loss_mask_shape = batch["loss_mask"][:, :-1].shape
+        loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).to(self.device_name)
         loss_fct = nn.CrossEntropyLoss(reduction="none")
 
         # Context manager for sequence parallel if needed
@@ -444,18 +449,17 @@ class FSDPSFTTrainer:
                 dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
             else:
                 dp_size = 1
-
+            loss_reshape = loss.view(loss_mask_shape).mean(1)
             loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
 
-            loss = loss / n_micro_batches  # normalize loss
+            loss = loss / n_micro_batches
 
             if do_backward:
                 loss.backward()
-            return loss
+            return loss, loss_reshape
 
-    def training_step(self, batch: TensorDict):
+    def training_step(self, batch: TensorDict, ids, loss_ema: np.ndarray, epoch: int):
         start_time = time.time()
-
         self.fsdp_model.train()
 
         log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
@@ -465,19 +469,81 @@ class FSDPSFTTrainer:
         log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
 
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
+        # Split ids to match micro_batches
+        micro_batch_size = self.config.data.micro_batch_size_per_gpu
+        micro_ids = [ids[i:i + micro_batch_size] for i in range(0, len(ids), micro_batch_size)]
+        
+        # 或者可以使用 TensorDict 的索引功能，例如：
+        # micro_batches = [batch[i:i + micro_batch_size] for i in range(0, len(batch), micro_batch_size)]
+        
         n_micro_batches = len(micro_batches)
         step_loss = 0
+        beta_1 = self.config.trainer.beta_1
+        beta_2 = self.config.trainer.beta_2
         ft, bt = 0.0, 0.0
-        for micro_batch in micro_batches:
+
+        if epoch >= self.config.trainer.stop_threshold:
+            for micro_batch, micro_id in zip(micro_batches, micro_ids):
+                t0 = time.perf_counter()
+                loss, loss_reshape = self._compute_loss_and_backward(batch=micro_batch, do_backward=False, n_micro_batches=n_micro_batches)
+                t1 = time.perf_counter()
+                loss.backward()
+                t2 = time.perf_counter()
+                ft += t1 - t0
+                bt += t2 - t1
+                step_loss += loss.item()
+        elif epoch < self.config.trainer.start_threshold:
+            for micro_batch, micro_id in zip(micro_batches, micro_ids):
+                t0 = time.perf_counter()
+                loss, loss_reshape = self._compute_loss_and_backward(batch=micro_batch, do_backward=False, n_micro_batches=n_micro_batches)
+                t1 = time.perf_counter()
+                loss.backward()
+                t2 = time.perf_counter()
+                ft += t1 - t0
+                bt += t2 - t1
+                step_loss += loss.item()
+                cur_loss_vals = torch.zeros(len(loss_ema)).cuda()
+                cur_loss_vals[micro_id.cpu().long()] = loss_reshape + 1e-8
+                torch.distributed.all_reduce(cur_loss_vals, op=torch.distributed.ReduceOp.SUM)
+                cur_loss_vals = cur_loss_vals.detach().cpu().numpy()
+                total_ids = np.where(cur_loss_vals >= 1e-8)[0]
+                loss_ema[total_ids] = beta_2 * loss_ema[total_ids] + \
+                    (1-beta_2) * cur_loss_vals[total_ids]
+        else:
             t0 = time.perf_counter()
-            loss = self._compute_loss_and_backward(batch=micro_batch, do_backward=False, n_micro_batches=n_micro_batches)
+            self.fsdp_model.eval()
+            cur_loss_vals = torch.zeros(len(loss_ema)).cuda()
+            for micro_batch, micro_id in zip(micro_batches, micro_ids):
+                with torch.no_grad():
+                    loss, loss_reshape = self._compute_loss_and_backward(batch=micro_batch, do_backward=False, n_micro_batches=n_micro_batches)
+                    cur_loss_vals[micro_id.cpu().long()] = loss_reshape + 1e-8
+                    torch.distributed.all_reduce(cur_loss_vals, op=torch.distributed.ReduceOp.SUM)
+                    
+            self.fsdp_model.train()
+            cur_loss_vals_np = cur_loss_vals.detach().cpu().numpy()
+            total_ids = np.where(cur_loss_vals_np >= 1e-8)[0]
+            tmp = beta_1 * loss_ema[total_ids] + (1-beta_1) * cur_loss_vals_np[total_ids]
+            tmp[np.isnan(tmp)] = 1e-8
+            prob = tmp / tmp.sum()
+
+            # world size
+            loss_ids_global = np.random.choice(
+                len(tmp), size=min(self.config.data.train_mini_batch_size*1, len(tmp)), replace=False, p=prob
+            )
+            loss_ids = np.where(np.isin(np.array(ids), total_ids[loss_ids_global]))[0]
+            loss, loss_reshape = self._compute_loss_and_backward(
+                batch=batch[loss_ids], do_backward=False
+            )
             t1 = time.perf_counter()
-            ft += t1 - t0
             loss.backward()
             t2 = time.perf_counter()
+            ft += t1 - t0
             bt += t2 - t1
             step_loss += loss.item()
-
+            # update loss_ema
+            loss_ema[total_ids] = beta_2 * loss_ema[total_ids] + \
+                (1-beta_2) * cur_loss_vals_np[total_ids]
+        self.train_dataloader.sampler.sampler.loss_ema = loss_ema
         if self.config.model.strategy == "fsdp":
             grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
         elif self.config.model.strategy == "fsdp2":
@@ -504,7 +570,6 @@ class FSDPSFTTrainer:
         log_gpu_memory_usage("After offload weights", logger=logger)
 
         step_loss = torch.tensor(step_loss).to(self.device_name)
-
         # compute time spent per step
         end_time = time.time()
         spend_time_per_step = end_time - start_time
@@ -521,11 +586,10 @@ class FSDPSFTTrainer:
             "train/forward_time(s)": round(ft, 3),
             "train/backward_time(s)": round(bt, 3),
         }
-
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
         with torch.no_grad():
-            loss = self._compute_loss_and_backward(batch, do_backward=False)
+            loss, loss_reshape = self._compute_loss_and_backward(batch, do_backward=False)
             if is_cuda_available:
                 torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
             elif is_npu_available:
@@ -711,7 +775,6 @@ class FSDPSFTTrainer:
                 project_name=self.config.trainer.project_name,
                 experiment_name=self.config.trainer.experiment_name,
                 default_backend=self.config.trainer.logger,
-                config=OmegaConf.to_container(self.config, resolve=True),
             )
 
         global_step = self.resume_global_step  # Start from resumed step
@@ -743,24 +806,27 @@ class FSDPSFTTrainer:
 
         # Calculate which epoch we're starting from for sampler.set_epoch()
         start_epoch = global_step // self.steps_per_epoch
-
-        train_time = 0
+        loss_ema = np.ones(len(self.train_dataset)) / len(self.train_dataset)
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
+            if epoch >= self.config.trainer.stop_threshold or epoch < self.config.trainer.start_threshold:
+                self.train_sampler.sampler.prune = False
+            else:
+                self.train_sampler.sampler.prune = True
             self.train_sampler.set_epoch(epoch=epoch)
 
-            for step_in_epoch, data in enumerate(
+            for step_in_epoch, (ids, data) in enumerate(
                 tqdm(
                     self.train_dataloader,
                     initial=global_step % self.steps_per_epoch if epoch == start_epoch else 0,
-                    total=self.steps_per_epoch,
+                    # total=self.steps_per_epoch,
+                    total=len(self.train_dataloader),
                     desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
                     disable=rank != 0,
                 )
             ):
                 global_step += 1
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
-                metric = self.training_step(data)
-                train_time += metric["train/time(s)"]
+                metric = self.training_step(data, ids, loss_ema, epoch)
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
 
@@ -790,7 +856,6 @@ class FSDPSFTTrainer:
 
                 if is_last_step:
                     if rank == 0:
-                        print(f"Total time for train steps: {train_time:.2f}s")
                         print(f"Final validation metrics: {last_valid_metric}")
                     return
 
@@ -851,6 +916,118 @@ def create_sft_dataset(data_paths, data_config, tokenizer):
     # Create datasets based on the selected class
     dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config)
     return dataset
+
+
+class IndexDataset(Dataset):
+    def __init__(self, dataset, original_index=None):
+        self.dataset = dataset
+        if original_index is None:
+            self.original_index = np.arange(len(dataset))
+        else:
+            self.original_index = original_index
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        return self.original_index[index], self.dataset[index]
+
+
+
+class AdaOrderPruningSampler(object):
+    def __init__(self, dataset, loss_ema, prune_ratio=0.2):
+        self.dataset = dataset
+        self.length = len(dataset)
+        self.loss_ema = loss_ema
+        self.prune_ratio = prune_ratio
+        self.keep_ratio = 1 - prune_ratio
+        self.keep_size = int(self.length*self.keep_ratio)
+        self.prune = False
+        self.iter_cnt = 0
+        self.sample_indices = None
+        self.iter_obj = None
+        self.reset()
+
+    def __getitem__(self, idx):
+        return self.sample_indices[idx]
+
+    def reset(self):
+        state = np.random.get_state()
+        np.random.seed(self.iter_cnt)
+        if self.prune:
+            prob = self.loss_ema / self.loss_ema.sum()
+            self.sample_indices = np.random.choice(
+                np.arange(self.length), size=self.keep_size, replace=False, p=prob).tolist()
+        else:
+            ids = np.arange(self.length)
+            np.random.shuffle(ids)
+            self.sample_indices = list(ids)
+        self.iter_obj = iter(self.sample_indices)
+        self.iter_cnt += 1
+        np.random.set_state(state)
+
+    def __next__(self):
+        return next(self.iter_obj)
+
+    def __len__(self):
+        return len(self.sample_indices)
+
+    def __iter__(self):
+        self.reset()
+        return self
+
+
+class DistributedAdaOrderPruningSampler(DistributedSampler):
+
+    def __init__(self, sampler: AdaOrderPruningSampler, num_replicas: Optional[int] = None,
+                 rank: Optional[int] = None, shuffle: bool = True,
+                 seed: int = 0, drop_last: bool = True):
+        super(DistributedAdaOrderPruningSampler, self).__init__(
+            sampler.dataset, num_replicas, rank, shuffle, seed, drop_last)
+        self.sampler = sampler
+        self.iter_obj = None
+
+    def __iter__(self) -> Iterator[int]:
+        self.sampler.reset()
+        # type: ignore[arg-type]
+        if self.drop_last and len(self.sampler) % self.num_replicas != 0:
+            # Split to nearest available length that is evenly divisible.
+            # This is to ensure each rank receives the same amount of data when
+            # using this Sampler.
+            self.num_samples = math.ceil(
+                (len(self.sampler) - self.num_replicas) /
+                self.num_replicas  # type: ignore[arg-type]
+            )
+        else:
+            self.num_samples = math.ceil(
+                len(self.sampler) / self.num_replicas)  # type: ignore[arg-type]
+        self.total_size = self.num_samples * self.num_replicas
+
+        if self.shuffle:
+            # deterministically shuffle based on epoch and seed
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            # type: ignore[arg-type]
+            indices = torch.randperm(len(self.sampler), generator=g).tolist()
+        else:
+            indices = list(range(len(self.sampler)))  # type: ignore[arg-type]
+
+        if not self.drop_last:
+            # add extra samples to make it evenly divisible
+            padding_size = self.total_size - len(indices)
+            if padding_size <= len(indices):
+                indices += indices[:padding_size]
+            else:
+                indices += (indices * math.ceil(padding_size /
+                            len(indices)))[:padding_size]
+        else:
+            # remove tail of data to make it evenly divisible.
+            indices = indices[:self.total_size]
+        assert len(indices) == self.total_size
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        # print('distribute iter is called')
+        self.iter_obj = iter(itemgetter(*indices)(self.sampler))
+        return self.iter_obj
 
 
 if __name__ == "__main__":
