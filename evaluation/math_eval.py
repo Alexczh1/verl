@@ -81,7 +81,7 @@ def prepare_data(data_name, args):
     out_file_prefix = f"{args.split}_{args.prompt_type}_{args.num_test_sample}_seed{args.seed}_t{args.temperature}"
     output_dir = args.output_dir
     if not os.path.exists(output_dir):
-        output_dir = f"outputs/{output_dir}"
+        os.makedirs(output_dir, exist_ok=True)
     out_file = f"{output_dir}/{data_name}/{out_file_prefix}_s{args.start}_e{args.end}.jsonl"
     os.makedirs(f"{output_dir}/{data_name}", exist_ok=True)
 
