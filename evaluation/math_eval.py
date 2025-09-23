@@ -40,6 +40,7 @@ def parse_args():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--use_safetensors", action="store_true")
     parser.add_argument("--num_shots", type=int, default=0)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument(
         "--apply_chat_template",
         action="store_true",
@@ -284,7 +285,7 @@ def main(llm, tokenizer, data_name, args):
                 tokenizer=tokenizer,
                 prompts=prompts,
                 max_new_tokens=args.max_tokens_per_call,
-                batch_size=16,
+                batch_size=args.batch_size,
                 stop_id_sequences=stop_words,
             )
 
