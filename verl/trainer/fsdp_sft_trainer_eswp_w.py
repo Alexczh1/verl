@@ -141,6 +141,8 @@ class FSDPSFTTrainer:
             print(self.config)
         self.device_name = self.config.trainer.device
 
+        self.current_ckpt_step = 0
+
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
         if self.device_mesh.get_rank() == 0:
@@ -469,14 +471,16 @@ class FSDPSFTTrainer:
 
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
+        micro_batch_size = self.config.data.micro_batch_size_per_gpu
+        micro_ids = [ids[i:i + micro_batch_size] for i in range(0, len(ids), micro_batch_size)]
         step_loss = 0
         ft, bt = 0.0, 0.0
-        for micro_batch in micro_batches:
+        for micro_batch, micro_id in zip(micro_batches, micro_ids):
             t0 = time.perf_counter()
             loss, loss_reshape = self._compute_loss_and_backward(batch=micro_batch, do_backward=False, n_micro_batches=n_micro_batches)
             step_loss += loss.item()
             cur_loss_vals = torch.zeros(len(loss_ema)).cuda()
-            cur_loss_vals[ids.cpu().long()] = loss_reshape + 1e-8
+            cur_loss_vals[micro_id.cpu().long()] = loss_reshape + 1e-8
             torch.distributed.all_reduce(cur_loss_vals, op=torch.distributed.ReduceOp.SUM)
             cur_loss_vals = cur_loss_vals.detach().cpu().numpy()
             total_ids = np.where(cur_loss_vals >= 1e-8)[0]
@@ -803,11 +807,11 @@ class FSDPSFTTrainer:
 
                 if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
                     self.save_checkpoint(step=global_step)
+        self.save_checkpoint(step=global_step)
 
-                if is_last_step:
-                    if rank == 0:
-                        print(f"Final validation metrics: {last_valid_metric}")
-                    return
+        if rank == 0:
+            print(f"Final validation metrics: {last_valid_metric}")
+        return
 
 
 def run_sft(config):

@@ -142,6 +142,8 @@ class FSDPSFTTrainer:
             print(self.config)
         self.device_name = self.config.trainer.device
 
+        self.current_ckpt_step = 0
+
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
         if self.device_mesh.get_rank() == 0:
@@ -531,15 +533,20 @@ class FSDPSFTTrainer:
                 len(tmp), size=min(self.config.data.train_mini_batch_size*1, len(tmp)), replace=False, p=prob
             )
             loss_ids = np.where(np.isin(np.array(ids), total_ids[loss_ids_global]))[0]
-            loss, loss_reshape = self._compute_loss_and_backward(
-                batch=batch[loss_ids], do_backward=False
-            )
-            t1 = time.perf_counter()
-            loss.backward()
-            t2 = time.perf_counter()
-            ft += t1 - t0
-            bt += t2 - t1
-            step_loss += loss.item()
+            micro_batches = batch[loss_ids].split(self.config.data.micro_batch_size_per_gpu)
+            n_micro_batches = len(micro_batches)
+            ft += time.perf_counter() - t0
+            for micro_batch in micro_batches:
+                t0 = time.perf_counter()
+                loss, loss_reshape = self._compute_loss_and_backward(
+                    batch=micro_batch, do_backward=False, n_micro_batches=n_micro_batches
+                )
+                t1 = time.perf_counter()
+                ft += t1 - t0
+                loss.backward()
+                t2 = time.perf_counter()
+                bt += t2 - t1
+                step_loss += loss.item()
             # update loss_ema
             loss_ema[total_ids] = beta_2 * loss_ema[total_ids] + \
                 (1-beta_2) * cur_loss_vals_np[total_ids]
@@ -586,6 +593,7 @@ class FSDPSFTTrainer:
             "train/forward_time(s)": round(ft, 3),
             "train/backward_time(s)": round(bt, 3),
         }
+    
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
         with torch.no_grad():
@@ -600,6 +608,13 @@ class FSDPSFTTrainer:
     def save_checkpoint(self, step):
         """Save checkpoint using FSDPCheckpointManager with improved tracking"""
         from verl.utils.fs import local_mkdir_safe
+
+        import shutil
+
+        # folder_path = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.current_ckpt_step}")
+        # if os.path.exists(folder_path):
+        #     shutil.rmtree(folder_path)
+        # self.current_ckpt_step = step
 
         # Determine checkpoint path
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{step}")
@@ -854,10 +869,11 @@ class FSDPSFTTrainer:
                 if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
                     self.save_checkpoint(step=global_step)
 
-                if is_last_step:
-                    if rank == 0:
-                        print(f"Final validation metrics: {last_valid_metric}")
-                    return
+        self.save_checkpoint(step=global_step)
+
+        if rank == 0:
+            print(f"Final validation metrics: {last_valid_metric}")
+        return
 
 
 def run_sft(config):
