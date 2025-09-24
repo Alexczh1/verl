@@ -1,9 +1,9 @@
 import os, torch, json
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-HF_DIR = "/media/volume/MultiAgent/checkpoints/msra-sft/baseline_H200_lr_1e-5_numina_30k_qwen2.5-1.5b/global_step_9370/huggingface"
-PT     = "/media/volume/MultiAgent/checkpoints/msra-sft/baseline_H200_lr_1e-5_numina_30k_qwen2.5-1.5b/global_step_9370/model_world_size_1_rank_0.pt"
-OUT    = "media/volume/MultiAgent/checkpoints/msra-sft/baseline_H200_lr_1e-5_numina_30k_qwen2.5-1.5b/global_step_9370/full_model"
+HF_DIR = "/media/volume/MultiAgent-Data/checkpoints/msra-sft/eswp_prune_.2_mb_8_H200_lr_1e-5_numina_30k_qwen2.5-math-1.5b/global_step_2000/huggingface"
+PT     = "/media/volume/MultiAgent-Data/checkpoints/msra-sft/eswp_prune_.2_mb_8_H200_lr_1e-5_numina_30k_qwen2.5-math-1.5b/global_step_2000/model_world_size_1_rank_0.pt"
+OUT    = "/media/volume/MultiAgent-Data/checkpoints/msra-sft/eswp_prune_.2_mb_8_H200_lr_1e-5_numina_30k_qwen2.5-math-1.5b/global_step_2000/full_model"
 
 def convert_dtensor_to_tensor(state_dict):
     """将DTensor转换为普通tensor"""
@@ -74,7 +74,6 @@ for k, v in sd.items():
     k = (k.replace("module.", "")
          .replace("_fsdp_wrapped_module.", "")
          .replace("_forward_module.", "")
-         .replace("model.", "")
          .replace("_orig_mod.", ""))
     
     if k != original_k:
