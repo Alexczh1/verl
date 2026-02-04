@@ -1,0 +1,15 @@
+srun --pty --partition=songmei --gpus=H200:1 /bin/bash
+srun --pty --partition=jsteinhardt --gpus=A5000:1 /bin/bash
+
+
+cd verl
+
+bash examples/ppo_trainer/run_qwen2.5-7b_gsm8k.sh
+bash examples/grpo_trainer/run_qwen2.5-1.5b_math.sh
+
+python examples/data_preprocess/gsm8k.py --local_dir /data/ziheng_cheng/dataset/gsm8k
+python examples/data_preprocess/math_dataset.py --local_dir /data/ziheng_cheng/dataset/math
+python examples/data_preprocess/aime2024_multiturn_w_tool.py --local_dir /data/ziheng_cheng/dataset/aime-2024
+
+
+Saved model to /data/ziheng_cheng/checkpoints/msra-sft/eswp_w_prune_.3_H200_numina_qwen2.5-1.5b/global_step_4500/model_world_size_1_rank_0.pt
