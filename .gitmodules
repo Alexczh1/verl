@@ -1,0 +1,3 @@
+[submodule "recipe"]
+	url = https://github.com/verl-project/verl-recipe.git
+	path = recipe
