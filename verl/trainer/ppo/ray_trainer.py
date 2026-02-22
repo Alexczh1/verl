@@ -796,28 +796,38 @@ class RayPPOTrainer:
                 diff_results = self.actor_rollout_wg.compute_actor_ref_param_diff(ref_state=ref_state_to_pass)
                 layer_diffs = next((r for r in diff_results if r), {})
                 # import rpdb
-                # import os
-                # port = 4444 + (os.getpid() % 1000)
-                # print(f"[rpdb] Connect in another terminal: nc localhost {port}")
                 # rpdb.set_trace()
                 
                 if layer_diffs:
                     total_unchange_param_num = layer_diffs.pop("total_unchange_param_num", None)
+                    total_unchange_param_abs_num = layer_diffs.pop("total_unchange_param_abs_num", None)
                     total_total_param_num = layer_diffs.pop("total_total_param_num", None)
                     total_sparsity = layer_diffs.pop("total_sparsity", None)
-                    layer_diffs.pop("total_total_param_num", None)
+                    total_sparsity_abs = layer_diffs.pop("total_sparsity_abs", None)
                     if total_unchange_param_num is not None:
                         metric_dict["sparsity/actor_ref/total_unchange_param_num (M)"] = total_unchange_param_num / 1e6
+                    if total_unchange_param_abs_num is not None:
+                        metric_dict["sparsity/actor_ref/total_unchange_param_abs_num (M)"] = total_unchange_param_abs_num / 1e6
                     if total_sparsity is not None:
                         metric_dict["sparsity/actor_ref/total_sparsity"] = total_sparsity
+                    if total_sparsity_abs is not None:
+                        metric_dict["sparsity/actor_ref/total_sparsity_abs"] = total_sparsity_abs
                     for layer_name, layer_data in layer_diffs.items():
                         layer_unchange_param_num = layer_data.pop("layer_unchange_param_num", None)
                         layer_total_param_num = layer_data.pop("layer_total_param_num", None)
                         layer_sparsity = layer_data.pop("layer_sparsity", None)
+                        layer_unchange_param_abs_num = layer_data.pop("layer_unchange_param_abs_num", None)
+                        layer_sparsity_abs = layer_data.pop("layer_sparsity_abs", None)
                         if layer_unchange_param_num is not None:
                             metric_dict[f"sparsity/actor_ref/{layer_name}/layer_unchange_param_num (M)"] = layer_unchange_param_num / 1e6
+                        if layer_unchange_param_abs_num is not None:
+                            metric_dict[f"sparsity/actor_ref/{layer_name}/layer_unchange_param_abs_num (M)"] = layer_unchange_param_abs_num / 1e6
                         if layer_sparsity is not None:
                             metric_dict[f"sparsity/actor_ref/{layer_name}/layer_sparsity"] = layer_sparsity
+                        if layer_sparsity_abs is not None:
+                            metric_dict[f"sparsity/actor_ref/{layer_name}/layer_sparsity_abs"] = layer_sparsity_abs
+                        if layer_total_param_num is not None:
+                            metric_dict[f"sparsity/actor_ref/{layer_name}/layer_total_param_num (M)"] = layer_total_param_num / 1e6
                     local_mkdir_safe(self.config.trainer.default_local_dir)
                     diff_path = os.path.join(
                         self.config.trainer.default_local_dir,

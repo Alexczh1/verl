@@ -958,7 +958,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             if not ref_state and not self._is_lora:
                 return {}
-
+            
             # layer_name -> param_diffs, layer_l2_sq, layer_l1, layer_ref_l2_sq, layer_ref_l1
             layer_diffs = defaultdict(
                 lambda: {
@@ -968,8 +968,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "layer_ref_l2_sq": 0.0,
                     "layer_ref_l1": 0.0,
                     "layer_unchange_param_num": 0,
+                    "layer_unchange_param_abs_num": 0,
                     "layer_total_param_num": 0,
                     "layer_sparsity": 0.0,
+                    "layer_sparsity_abs": 0.0,
                 }
             )
 
@@ -1004,15 +1006,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     ref_l1 = float(ref_param.abs().sum().item())
                     ratio_l2 = (diff_l2 / ref_l2) if ref_l2 > 0 else None
                     ratio_l1 = (diff_l1 / ref_l1) if ref_l1 > 0 else None
-                    unchange_param_num = float(torch.sum((diff.abs() / torch.maximum(ref_param.abs(), actor_param.abs())) <= 1e-3).item())
-                    # unchange_num = torch.sum(diff.abs() <= 1e-5).item()
+                    unchange_param_num = float(torch.sum((diff.abs() / torch.maximum(ref_param.abs()+1e-8, actor_param.abs()+1e-8)) <= 1e-3).item())
+                    unchange_param_abs_num = float(torch.sum(diff.abs() <= 1e-5).item())
                     sparsity = unchange_param_num / total_param_num
+                    sparsity_abs = unchange_param_abs_num / total_param_num
                 else:
                     ref_l2 = ref_l1 = 0.0
                     ref_l2_sq = 0.0
                     ratio_l2 = ratio_l1 = None
                     unchange_param_num = 0
+                    unchange_param_abs_num = 0
                     sparsity = 0.0
+                    sparsity_abs = 0.0
 
                 layer_name = self._param_name_to_layer_name(name)
                 layer_diffs[layer_name]["param_diffs"][name] = {
@@ -1023,14 +1028,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "ratio_l2": ratio_l2,
                     "ratio_l1": ratio_l1,
                     "unchange_param_num": unchange_param_num,
+                    "unchange_param_abs_num": unchange_param_abs_num,
                     "total_param_num": total_param_num,
                     "sparsity": sparsity,
+                    "sparsity_abs": sparsity_abs,
                 }
                 layer_diffs[layer_name]["layer_l2_sq"] += diff_l2_sq
                 layer_diffs[layer_name]["layer_l1"] += diff_l1
                 layer_diffs[layer_name]["layer_total_param_num"] += total_param_num
                 layer_diffs[layer_name]["layer_unchange_param_num"] += unchange_param_num
-                # layer_diffs[layer_name]["layer_sparsity"] = layer_diffs[layer_name]["layer_unchange_param_num"] / layer_diffs[layer_name]["layer_total_param_num"]
+                layer_diffs[layer_name]["layer_unchange_param_abs_num"] += unchange_param_abs_num
+                layer_diffs[layer_name]["layer_sparsity"] += sparsity
+                layer_diffs[layer_name]["layer_sparsity_abs"] += sparsity_abs
                 if ref_param is not None:
                     layer_diffs[layer_name]["layer_ref_l2_sq"] += ref_l2_sq
                     layer_diffs[layer_name]["layer_ref_l1"] += ref_l1
@@ -1038,6 +1047,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # Build serializable result with layer-level aggregates
             result = {}
             result["total_unchange_param_num"] = 0
+            result["total_unchange_param_abs_num"] = 0
             result["total_total_param_num"] = 0
             for layer_name, data in layer_diffs.items():
                 layer_l2 = float(data["layer_l2_sq"] ** 0.5)
@@ -1046,8 +1056,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 layer_ref_l2 = float(layer_ref_l2_sq**0.5) if layer_ref_l2_sq > 0 else 0.0
                 layer_ref_l1 = float(data["layer_ref_l1"])
                 layer_unchange_param_num = float(data["layer_unchange_param_num"])
+                layer_unchange_param_abs_num = float(data["layer_unchange_param_abs_num"])
                 layer_total_param_num = float(data["layer_total_param_num"])
                 layer_sparsity = layer_unchange_param_num / layer_total_param_num
+                layer_sparsity_abs = layer_unchange_param_abs_num / layer_total_param_num
                 layer_ratio_l2 = (layer_l2 / layer_ref_l2) if layer_ref_l2 > 0 else None
                 layer_ratio_l1 = (layer_l1 / layer_ref_l1) if layer_ref_l1 > 0 else None
                 result[layer_name] = {
@@ -1059,19 +1071,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "layer_ratio_l2": layer_ratio_l2,
                     "layer_ratio_l1": layer_ratio_l1,
                     "layer_unchange_param_num": layer_unchange_param_num,
+                    "layer_unchange_param_abs_num": layer_unchange_param_abs_num,
                     "layer_total_param_num": layer_total_param_num,
                     "layer_sparsity": layer_sparsity,
+                    "layer_sparsity_abs": layer_sparsity_abs,
                 }
                 result["total_unchange_param_num"] += layer_unchange_param_num
+                result["total_unchange_param_abs_num"] += layer_unchange_param_abs_num
                 result["total_total_param_num"] += layer_total_param_num
-            result["total_sparsity"] = result["total_unchange_param_num"] / result["total_total_param_num"]
+                result["total_sparsity"] = result["total_unchange_param_num"] / result["total_total_param_num"]
+                result["total_sparsity_abs"] = result["total_unchange_param_abs_num"] / result["total_total_param_num"]
         except Exception as e:
-            logger.warning("compute_actor_ref_param_diff failed: %s", e)
+            print("compute_actor_ref_param_diff failed: %s", e)
             result = {}
         finally:
             if self._is_offload_param:
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-
+        
         return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
