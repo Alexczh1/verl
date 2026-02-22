@@ -271,6 +271,19 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator in [AdvantageEstimator.PSR, AdvantageEstimator.NSR]:
+        # Initialize the mask for GRPO calculation
+        grpo_calculation_mask = data.batch["response_mask"]
+        # Call compute_grpo_outcome_advantage with parameters matching its definition
+        advantages, returns = core_algos.compute_pnsr_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=grpo_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            type=adv_estimator,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -767,6 +780,55 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
+        # Compute and save per-layer param diff (actor - ref_model) on actor worker (FSDP only)
+        if (self.use_reference_policy or self.ref_in_actor) and hasattr(
+            self.actor_rollout_wg, "compute_actor_ref_param_diff"
+        ):
+            try:
+                from verl.utils.fs import local_mkdir_safe
+
+                ref_state_to_pass = None
+                if self.use_reference_policy and not self.ref_in_actor and hasattr(self, "ref_policy_wg") and hasattr(
+                    self.ref_policy_wg, "get_ref_full_state_dict"
+                ):
+                    ref_state_results = self.ref_policy_wg.get_ref_full_state_dict()
+                    ref_state_to_pass = next((r for r in ref_state_results if r), None)
+                diff_results = self.actor_rollout_wg.compute_actor_ref_param_diff(ref_state=ref_state_to_pass)
+                layer_diffs = next((r for r in diff_results if r), {})
+                # import rpdb
+                # import os
+                # port = 4444 + (os.getpid() % 1000)
+                # print(f"[rpdb] Connect in another terminal: nc localhost {port}")
+                # rpdb.set_trace()
+                
+                if layer_diffs:
+                    total_unchange_param_num = layer_diffs.pop("total_unchange_param_num", None)
+                    total_total_param_num = layer_diffs.pop("total_total_param_num", None)
+                    total_sparsity = layer_diffs.pop("total_sparsity", None)
+                    layer_diffs.pop("total_total_param_num", None)
+                    if total_unchange_param_num is not None:
+                        metric_dict["sparsity/actor_ref/total_unchange_param_num (M)"] = total_unchange_param_num / 1e6
+                    if total_sparsity is not None:
+                        metric_dict["sparsity/actor_ref/total_sparsity"] = total_sparsity
+                    for layer_name, layer_data in layer_diffs.items():
+                        layer_unchange_param_num = layer_data.pop("layer_unchange_param_num", None)
+                        layer_total_param_num = layer_data.pop("layer_total_param_num", None)
+                        layer_sparsity = layer_data.pop("layer_sparsity", None)
+                        if layer_unchange_param_num is not None:
+                            metric_dict[f"sparsity/actor_ref/{layer_name}/layer_unchange_param_num (M)"] = layer_unchange_param_num / 1e6
+                        if layer_sparsity is not None:
+                            metric_dict[f"sparsity/actor_ref/{layer_name}/layer_sparsity"] = layer_sparsity
+                    local_mkdir_safe(self.config.trainer.default_local_dir)
+                    diff_path = os.path.join(
+                        self.config.trainer.default_local_dir,
+                        f"actor_ref_layer_diff_step_{self.global_steps}.json",
+                    )
+                    with open(diff_path, "w", encoding="utf-8") as f:
+                        json.dump(layer_diffs, f, indent=2, ensure_ascii=False)
+                    print(f"Saved actor vs ref per-layer param diff to {diff_path}")
+            except Exception as e:
+                print(f"compute_actor_ref_param_diff skipped: {e}")
+
         return metric_dict
 
     def init_workers(self):
@@ -1179,6 +1241,16 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
+                    # from ray.util.rpdb import set_trace
+                    # set_trace()
+                    
+                    # teacher_template = "{input}. Here is a reference solution {sol}. Now answer with a solution of your own, including the thinking process:"
+                    # inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+                    # outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+                    # teacher_inputs = [teacher_template.format(input=input, sol=output) for input, output in zip(inputs, outputs)]
+                    # teacher_inputs = self.tokenizer(teacher_inputs, padding=True, truncation=True, max_length=self.config.actor_rollout_ref.actor.max_seq_len, return_tensors="pt")
+                    # # batch = batch.union(teacher_inputs)
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):

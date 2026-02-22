@@ -3,10 +3,10 @@ accelerate
 codetiming
 datasets
 dill
-flash-attn
+flash-attn==2.8.3
 hydra-core
 liger-kernel
-numpy<2.0.0
+numpy==1.26.4
 pandas
 peft
 pyarrow>=19.0.0
@@ -17,7 +17,7 @@ ray[default]
 tensordict>=0.8.0,<=0.9.1,!=0.9.0
 torchdata
 transformers
-# vllm==0.8.4
+vllm==0.10.0
 wandb
 packaging>=20.0
 uvicorn

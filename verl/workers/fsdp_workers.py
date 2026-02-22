@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import warnings
+from collections import defaultdict
 from dataclasses import asdict
 from typing import Any
 
@@ -59,6 +60,7 @@ from verl.utils.fsdp_utils import (
     apply_fsdp2,
     fsdp2_load_full_state_dict,
     fsdp_version,
+    get_fsdp_full_state_dict,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     get_shard_placement_fn,
@@ -886,6 +888,191 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    def _param_name_to_layer_name(self, param_name: str) -> str:
+        """Extract layer name from param name for grouping (e.g. model.layers.0.xxx -> layer_0)."""
+        import re
+        match = re.search(r"\.layers\.(\d+)\.", param_name)
+        if match:
+            return f"layer_{match.group(1)}"
+        if "embed" in param_name or "norm" in param_name and "layers" not in param_name:
+            return "embed_or_norm"
+        return "other"
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_ref_full_state_dict(self) -> dict:
+        """
+        Return full state dict of ref model (rank 0 only). Used when ref is in a separate
+        worker group so trainer can pass ref_state to actor's compute_actor_ref_param_diff.
+        All ranks must call get_fsdp_full_state_dict to participate in the collective; only rank 0 returns the dict.
+        """
+        if not self._is_ref or not hasattr(self, "ref_module_fsdp"):
+            return {}
+        try:
+            state_dict = get_fsdp_full_state_dict(
+                self.ref_module_fsdp, offload_to_cpu=True, rank0_only=True
+            )
+            if dist.get_rank() != 0:
+                return {}
+            return state_dict
+        except Exception as e:
+            logger.warning("get_ref_full_state_dict failed: %s", e)
+            return {}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def compute_actor_ref_param_diff(self, ref_state=None) -> dict:
+        """
+        Compute per-layer L2/L1 norm of (actor_param - ref_param) and ratio = diff_norm / ref_norm.
+        ref_state: optional state dict of ref model; when ref is in a separate worker group,
+                   trainer should get it via ref_policy_wg.get_ref_full_state_dict() and pass here.
+        When ref is in same worker (actor_rollout_ref), ref_state is obtained from self.ref_module_fsdp.
+        When LoRA, ref is logical (base); only lora param norms are reported (ratio N/A when ref=0).
+        Returns dict: layer_name -> {
+            "param_diffs": {param_name: {"l2", "l1", "ref_l2", "ref_l1", "ratio_l2", "ratio_l1"}},
+            "layer_l2", "layer_l1", "layer_ref_l2", "layer_ref_l1", "layer_ratio_l2", "layer_ratio_l1"
+        }.
+        """
+        if not self._is_actor:
+            return {}
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        try:
+            # All ranks must participate in get_fsdp_full_state_dict collectives; only rank 0 uses the result.
+            actor_state = get_fsdp_full_state_dict(
+                self.actor_module_fsdp, offload_to_cpu=True, rank0_only=True
+            )
+            # ref_state: from argument (trainer passed ref from ref_policy_wg), or from self when colocated
+            if ref_state is not None:
+                pass  # use ref_state passed in
+            elif self._is_ref and hasattr(self, "ref_module_fsdp"):
+                ref_state = get_fsdp_full_state_dict(
+                    self.ref_module_fsdp, offload_to_cpu=True, rank0_only=True
+                )
+            else:
+                ref_state = {}
+
+            if dist.get_rank() != 0:
+                return {}
+
+            if not ref_state and not self._is_lora:
+                return {}
+
+            # layer_name -> param_diffs, layer_l2_sq, layer_l1, layer_ref_l2_sq, layer_ref_l1
+            layer_diffs = defaultdict(
+                lambda: {
+                    "param_diffs": {},
+                    "layer_l2_sq": 0.0,
+                    "layer_l1": 0.0,
+                    "layer_ref_l2_sq": 0.0,
+                    "layer_ref_l1": 0.0,
+                    "layer_unchange_param_num": 0,
+                    "layer_total_param_num": 0,
+                    "layer_sparsity": 0.0,
+                }
+            )
+
+            for name, actor_param in actor_state.items():
+                if not isinstance(actor_param, torch.Tensor):
+                    continue
+                actor_param = actor_param.float()
+                ref_param = None
+                if self._is_lora and "lora" in name.lower():
+                    # LoRA: ref = 0 for adapter params
+                    diff = actor_param
+                elif name in ref_state and isinstance(ref_state[name], torch.Tensor):
+                    ref_param = ref_state[name].float()
+                    if ref_param.shape == actor_param.shape:
+                        diff = actor_param - ref_param
+                    else:
+                        continue
+                elif self._is_lora:
+                    # Base param in LoRA: ref = actor (base unchanged), diff = 0
+                    continue
+                else:
+                    continue
+
+                diff_l2_sq = (diff * diff).sum().item()
+                diff_l2 = float(diff_l2_sq**0.5)
+                diff_l1 = float(diff.abs().sum().item())
+                total_param_num = diff.numel()
+
+                if ref_param is not None:
+                    ref_l2_sq = (ref_param * ref_param).sum().item()
+                    ref_l2 = float(ref_l2_sq**0.5)
+                    ref_l1 = float(ref_param.abs().sum().item())
+                    ratio_l2 = (diff_l2 / ref_l2) if ref_l2 > 0 else None
+                    ratio_l1 = (diff_l1 / ref_l1) if ref_l1 > 0 else None
+                    unchange_param_num = float(torch.sum((diff.abs() / torch.maximum(ref_param.abs(), actor_param.abs())) <= 1e-3).item())
+                    # unchange_num = torch.sum(diff.abs() <= 1e-5).item()
+                    sparsity = unchange_param_num / total_param_num
+                else:
+                    ref_l2 = ref_l1 = 0.0
+                    ref_l2_sq = 0.0
+                    ratio_l2 = ratio_l1 = None
+                    unchange_param_num = 0
+                    sparsity = 0.0
+
+                layer_name = self._param_name_to_layer_name(name)
+                layer_diffs[layer_name]["param_diffs"][name] = {
+                    "l2": diff_l2,
+                    "l1": diff_l1,
+                    "ref_l2": ref_l2,
+                    "ref_l1": ref_l1,
+                    "ratio_l2": ratio_l2,
+                    "ratio_l1": ratio_l1,
+                    "unchange_param_num": unchange_param_num,
+                    "total_param_num": total_param_num,
+                    "sparsity": sparsity,
+                }
+                layer_diffs[layer_name]["layer_l2_sq"] += diff_l2_sq
+                layer_diffs[layer_name]["layer_l1"] += diff_l1
+                layer_diffs[layer_name]["layer_total_param_num"] += total_param_num
+                layer_diffs[layer_name]["layer_unchange_param_num"] += unchange_param_num
+                # layer_diffs[layer_name]["layer_sparsity"] = layer_diffs[layer_name]["layer_unchange_param_num"] / layer_diffs[layer_name]["layer_total_param_num"]
+                if ref_param is not None:
+                    layer_diffs[layer_name]["layer_ref_l2_sq"] += ref_l2_sq
+                    layer_diffs[layer_name]["layer_ref_l1"] += ref_l1
+
+            # Build serializable result with layer-level aggregates
+            result = {}
+            result["total_unchange_param_num"] = 0
+            result["total_total_param_num"] = 0
+            for layer_name, data in layer_diffs.items():
+                layer_l2 = float(data["layer_l2_sq"] ** 0.5)
+                layer_l1 = float(data["layer_l1"])
+                layer_ref_l2_sq = data["layer_ref_l2_sq"]
+                layer_ref_l2 = float(layer_ref_l2_sq**0.5) if layer_ref_l2_sq > 0 else 0.0
+                layer_ref_l1 = float(data["layer_ref_l1"])
+                layer_unchange_param_num = float(data["layer_unchange_param_num"])
+                layer_total_param_num = float(data["layer_total_param_num"])
+                layer_sparsity = layer_unchange_param_num / layer_total_param_num
+                layer_ratio_l2 = (layer_l2 / layer_ref_l2) if layer_ref_l2 > 0 else None
+                layer_ratio_l1 = (layer_l1 / layer_ref_l1) if layer_ref_l1 > 0 else None
+                result[layer_name] = {
+                    "param_diffs": data["param_diffs"],
+                    "layer_l2": layer_l2,
+                    "layer_l1": layer_l1,
+                    "layer_ref_l2": layer_ref_l2,
+                    "layer_ref_l1": layer_ref_l1,
+                    "layer_ratio_l2": layer_ratio_l2,
+                    "layer_ratio_l1": layer_ratio_l1,
+                    "layer_unchange_param_num": layer_unchange_param_num,
+                    "layer_total_param_num": layer_total_param_num,
+                    "layer_sparsity": layer_sparsity,
+                }
+                result["total_unchange_param_num"] += layer_unchange_param_num
+                result["total_total_param_num"] += layer_total_param_num
+            result["total_sparsity"] = result["total_unchange_param_num"] / result["total_total_param_num"]
+        except Exception as e:
+            logger.warning("compute_actor_ref_param_diff failed: %s", e)
+            result = {}
+        finally:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
