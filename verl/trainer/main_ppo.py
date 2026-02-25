@@ -207,6 +207,11 @@ class TaskRunner:
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
 
+        # Add ref2 (second reference policy) worker if actor_rollout_ref2 is configured.
+        if OmegaConf.select(config, "actor_rollout_ref2") is not None:
+            role_worker_mapping[Role.Ref2Policy] = ray.remote(ActorRolloutRefWorker)
+            mapping[Role.Ref2Policy] = global_pool_id
+
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})

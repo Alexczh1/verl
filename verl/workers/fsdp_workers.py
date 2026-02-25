@@ -118,6 +118,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self.config = config
         self.profile_option = kwargs.get("profile_option", None)
+        self.role = role
+        assert self.role in ["actor", "rollout", "ref", "ref2", "actor_rollout", "actor_rollout_ref"]
+
+        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
+        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
+        self._is_ref = self.role in ["ref", "ref2", "actor_rollout_ref"]
+
         import torch.distributed
 
         if not torch.distributed.is_initialized():
@@ -130,14 +137,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
 
-        # build device mesh for FSDP
+        # build device mesh for FSDP (ref/ref2 use config.ref, actor/rollout use config.actor)
         world_size = torch.distributed.get_world_size()
         # TODO(sgm): support FSDP hybrid shard for larger model
-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
+        if self._is_ref:
+            fsdp_size = self.config.ref.fsdp_config.get("fsdp_size", -1)
+            self.ulysses_sequence_parallel_size = self.config.ref.get("ulysses_sequence_parallel_size", 1)
+        else:
+            fsdp_size = self.config.actor.fsdp_config.fsdp_size
+            self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
 
         # build device mesh for Ulysses Sequence Parallel
         self.ulysses_device_mesh = None
-        self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
         dp = world_size // self.ulysses_sequence_parallel_size
         if self.ulysses_sequence_parallel_size > 1:
             self.ulysses_device_mesh = init_device_mesh(
@@ -147,13 +159,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self._lora_rank = self.config.model.get("lora_rank", 0)
         self._is_lora = self._lora_rank > 0
-
-        self.role = role
-        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
-
-        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
-        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
-        self._is_ref = self.role in ["ref", "actor_rollout_ref"]
 
         # TODO(haibin.lin):
         # As of now the type of config is DictConfig, if we assign config.profiler with ProfilerConfig,
@@ -371,7 +376,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # We force reference policy to use CPUOffload to save memory.
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
-        fsdp_strategy = self.config.actor.strategy
+        fsdp_strategy = self.config.ref.strategy if role == "ref" else self.config.actor.strategy
         if fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(
                 actor_module,
@@ -1007,7 +1012,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     ratio_l2 = (diff_l2 / ref_l2) if ref_l2 > 0 else None
                     ratio_l1 = (diff_l1 / ref_l1) if ref_l1 > 0 else None
                     unchange_param_num = float(torch.sum((diff.abs() / torch.maximum(ref_param.abs()+1e-8, actor_param.abs()+1e-8)) <= 1e-3).item())
-                    unchange_param_abs_num = float(torch.sum(diff.abs() <= 1e-5).item())
+                    unchange_param_abs_num = float(torch.sum(diff.abs() == 0).item())
                     sparsity = unchange_param_num / total_param_num
                     sparsity_abs = unchange_param_abs_num / total_param_num
                 else:

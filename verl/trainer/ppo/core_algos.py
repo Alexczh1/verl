@@ -103,6 +103,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     PSR = "psr"
     NSR = "nsr"
+    VANILLA = "vanilla"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -324,6 +325,18 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+@register_adv_est(AdvantageEstimator.VANILLA)
+def compute_vanilla_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    advantages = token_level_rewards * response_mask
+    return advantages, advantages
 
 @register_adv_est(AdvantageEstimator.PSR)
 @register_adv_est(AdvantageEstimator.NSR)

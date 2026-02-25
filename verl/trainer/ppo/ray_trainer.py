@@ -32,10 +32,12 @@ from typing import Optional
 import numpy as np
 import ray
 import torch
-from omegaconf import OmegaConf, open_dict
+from omegaconf import OmegaConf, open_dict, DictConfig
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
+
+from tensordict import TensorDict
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
@@ -76,6 +78,7 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
+    Ref2Policy = 7
 
 
 @dataclass
@@ -193,6 +196,46 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
+def apply_opd_reward(data: DataProto, opd_config: DictConfig, kl_penalty="kl"):
+    """Apply KL penalty to the token-level rewards.
+
+    This function computes the KL divergence between the reference policy and current policy,
+    then applies a penalty to the token-level rewards based on this divergence.
+
+    Args:
+        data (DataProto): The data containing batched model outputs and inputs.
+        kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
+        multi_turn (bool, optional): Whether the data is from a multi-turn conversation. Defaults to False.
+
+    Returns:
+        tuple: A tuple containing:
+            - The updated data with token-level rewards adjusted by KL penalty
+            - A dictionary of metrics related to the KL penalty
+    """
+    response_mask = data.batch["response_mask"]
+    token_level_scores = data.batch["token_level_scores"]
+    batch_size = data.batch.batch_size[0]
+
+    # compute kl between ref_policy and current policy
+    # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
+    kld = core_algos.kl_penalty(
+        data.batch["old_log_probs"], data.batch["ref2_log_prob"], kl_penalty=kl_penalty
+    )  # (batch_size, response_length)
+    kld = kld * response_mask
+    alpha = opd_config.reward_coef
+    beta = opd_config.kl_coef
+
+    token_level_rewards = alpha * token_level_scores - beta * kld
+
+    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+    current_kl = torch.mean(current_kl, dim=0).item()
+
+    data.batch["token_level_rewards"] = token_level_rewards
+
+    metrics = {"actor/opd_kl_penalty": current_kl, "actor/opd_kl_coeff": beta}
+
+    return data, metrics
+
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 
@@ -284,6 +327,17 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.VANILLA:
+        # Initialize the mask for GRPO calculation
+        grpo_calculation_mask = data.batch["response_mask"]
+        # Call compute_grpo_outcome_advantage with parameters matching its definition
+        advantages, returns = core_algos.compute_vanilla_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=grpo_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -366,6 +420,7 @@ class RayPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
+        self.use_ref2_policy = Role.Ref2Policy in role_worker_mapping
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
@@ -381,6 +436,9 @@ class RayPPOTrainer:
         # kl loss control currently not suppoorted
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
+        
+        if self.config.algorithm.algorithm_type == "opd":
+            self.opd_kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         if config.critic.enable is not None:
             self.use_critic = bool(config.critic.enable)
@@ -585,6 +643,103 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _build_ref2_batch_with_modified_prompt(self, batch: DataProto) -> DataProto:
+        """Build a batch with modified input prompt for ref2 (e.g. teacher prompt template).
+
+        If algorithm.teacher_prompt_template is set (string or dict of name -> template), formats each sample
+        with {input} and {student_output} and replaces input_ids/attention_mask/position_ids so ref2 sees the new prompt.
+        When teacher_prompt_template is a dict, algorithm.teacher_prompt_template_name selects which template to use.
+        """
+        raw = OmegaConf.select(self.config, "algorithm.teacher_prompt_template")
+        if raw is None:
+            return batch
+        # Support dict (name -> template) or legacy single string
+        if hasattr(raw, "items") or isinstance(raw, dict):
+            name = OmegaConf.select(self.config, "algorithm.teacher_prompt_template_name") or "default"
+            template = raw.get(str(name), raw.get("default")) if hasattr(raw, "get") else None
+            if template is None:
+                return batch
+            template = str(template).strip()
+        else:
+            template = str(raw).strip()
+        if not template or "{input}" not in template:
+            return batch
+
+        input_ids = batch.batch["input_ids"]
+        attention_mask = batch.batch["attention_mask"]
+        position_ids = batch.batch["position_ids"]
+        responses = batch.batch["responses"]
+        device = input_ids.device
+        pad_token_id = getattr(
+            self.tokenizer, "pad_token_id", None
+        ) or getattr(self.tokenizer, "eos_token_id", 0)
+        batch_size, seq_len = input_ids.shape
+        response_length = responses.size(1)
+        prompt_length = seq_len - response_length
+
+        new_input_ids_list = []
+        new_responses_list = []
+        for i in range(batch_size):
+            prompt_ids = input_ids[i, :prompt_length]
+            response_ids = responses[i]
+            prompt_str = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+            student_str = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            if "{student_output}" not in template:
+                new_text = template.format(input=prompt_str)
+            else:
+                new_text = template.format(input=prompt_str, student_output=student_str)
+            enc = self.tokenizer(
+                new_text,
+                add_special_tokens=False,
+                return_tensors="pt",
+                truncation=True,
+                max_length=seq_len,
+                padding=False,
+            )
+            new_ids = enc.input_ids.squeeze(0).to(device)
+            if new_ids.dim() == 0:
+                new_ids = new_ids.unsqueeze(0)
+            # Response part for log_prob: last response_length tokens (student output in new sequence)
+            resp_len = min(response_length, new_ids.size(0))
+            new_resp = torch.full(
+                (response_length,), pad_token_id, dtype=new_ids.dtype, device=device
+            )
+            new_resp[:resp_len] = new_ids[-resp_len:]
+            new_input_ids_list.append(new_ids)
+            new_responses_list.append(new_resp)
+        # Pad/truncate to seq_len
+        new_input_ids = torch.full(
+            (batch_size, seq_len), pad_token_id, dtype=input_ids.dtype, device=device
+        )
+        new_attention_mask = torch.zeros(batch_size, seq_len, dtype=attention_mask.dtype, device=device)
+        for i in range(batch_size):
+            ids = new_input_ids_list[i]
+            L = min(ids.size(0), seq_len)
+            new_input_ids[i, :L] = ids[:L]
+            new_attention_mask[i, :L] = 1
+        new_position_ids = new_attention_mask.cumsum(-1) - 1
+        new_position_ids[new_attention_mask == 0] = 0
+        new_responses = torch.stack(new_responses_list, dim=0)
+
+        # Ref compute_log_prob only needs these four keys; use only them so TensorDict batch_size is consistent
+        n = int(new_input_ids.shape[0])
+        new_batch_td = TensorDict(
+            source={
+                "input_ids": new_input_ids,
+                "attention_mask": new_attention_mask,
+                "position_ids": new_position_ids,
+                "responses": new_responses,
+            },
+            batch_size=torch.Size([n]),
+            device=new_input_ids.device,
+        )
+        # meta_info must include micro_batch_size, temperature, etc. for ref worker
+        meta = dict(batch.meta_info)
+        if "micro_batch_size" not in meta and "micro_batch_size_per_gpu" not in meta:
+            meta.setdefault("micro_batch_size_per_gpu", meta.get("micro_batch_size"))
+        non_tensor = dict(batch.non_tensor_batch) if batch.non_tensor_batch else {}
+        return DataProto(batch=new_batch_td, meta_info=meta, non_tensor_batch=non_tensor)
 
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -883,6 +1038,17 @@ class RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
 
+        # create ref2 (second reference policy) if needed
+        if self.use_ref2_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Ref2Policy)
+            ref2_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.Ref2Policy],
+                config=self.config.actor_rollout_ref2,
+                role="ref2",
+                profile_option=self.config.trainer.npu_profile.options,
+            )
+            self.resource_pool_to_cls[resource_pool]["ref2"] = ref2_policy_cls
+
         # create a reward model if reward_fn is None
         if self.use_rm:
             # we create a RM here
@@ -926,6 +1092,10 @@ class RayPPOTrainer:
         if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = all_wg["ref"]
             self.ref_policy_wg.init_model()
+
+        if self.use_ref2_policy:
+            self.ref2_policy_wg = all_wg["ref2"]
+            self.ref2_policy_wg.init_model()
 
         if self.use_rm:
             self.rm_wg = all_wg["rm"]
@@ -1306,6 +1476,17 @@ class RayPPOTrainer:
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+        
+                    if self.use_ref2_policy:
+                        # compute ref2 log_prob (optionally with modified input prompt from teacher_prompt_template)
+                        with marked_timer("ref2", timing_raw, color="purple"):
+                            batch_ref2 = self._build_ref2_batch_with_modified_prompt(batch)
+                            ref2_log_prob = self.ref2_policy_wg.compute_ref_log_prob(batch_ref2)
+                            # Rename key so batch has "ref2_log_prob" instead of "ref_log_prob"
+                            ref2_log_prob = DataProto.from_dict(
+                                tensors={"ref2_log_prob": ref2_log_prob.batch["ref_log_prob"]}
+                            )
+                            batch = batch.union(ref2_log_prob)
 
                     # compute values
                     if self.use_critic:
@@ -1331,6 +1512,13 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                        
+                        # compute opd reward
+                        if self.config.algorithm.algorithm_type == "opd":
+                            batch, opd_metrics = apply_opd_reward(
+                                batch, opd_config=self.config.algorithm.opd, kl_penalty=self.config.algorithm.opd.kl_penalty
+                            )
+                            metrics.update(opd_metrics)
 
                         # compute advantages, executed on the driver process
 
