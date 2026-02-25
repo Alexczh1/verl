@@ -1,0 +1,54 @@
+# OPD trainer: inherits all settings from ppo_trainer and adds ref2 (second reference model).
+defaults:
+
+  # Same base as ppo_trainer
+  - ppo_trainer
+
+  # This file overrides or adds on top
+  - _self_
+
+# Second reference model (ref2). All settings default to actor_rollout_ref; only override model.path for ref2.
+# ref2.ref points to the same ref as actor_rollout_ref.ref, so CLI overrides (e.g. ref@actor_rollout_ref.ref: megatron_ref) apply to both.
+actor_rollout_ref2:
+
+  ref: ${actor_rollout_ref.ref}
+  hybrid_engine: ${actor_rollout_ref.hybrid_engine}
+  actor: ${actor_rollout_ref.actor}
+  rollout: ${actor_rollout_ref.rollout}
+  profiler: ${actor_rollout_ref.profiler}
+
+  model:
+    # Huggingface model path for the second reference model. Override in CLI or your override yaml.
+    path: ~/models/ref2_model
+    custom_chat_template: ${actor_rollout_ref.model.custom_chat_template}
+    use_shm: ${actor_rollout_ref.model.use_shm}
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    override_config: ${actor_rollout_ref.model.override_config}
+    enable_gradient_checkpointing: ${actor_rollout_ref.model.enable_gradient_checkpointing}
+    enable_activation_offload: ${actor_rollout_ref.model.enable_activation_offload}
+    use_remove_padding: ${actor_rollout_ref.model.use_remove_padding}
+    lora_rank: ${actor_rollout_ref.model.lora_rank}
+    lora_alpha: ${actor_rollout_ref.model.lora_alpha}
+    target_modules: ${actor_rollout_ref.model.target_modules}
+    exclude_modules: ${actor_rollout_ref.model.exclude_modules}
+    use_liger: ${actor_rollout_ref.model.use_liger}
+    use_fused_kernels: ${actor_rollout_ref.model.use_fused_kernels}
+    fused_kernel_options: ${actor_rollout_ref.model.fused_kernel_options}
+    trust_remote_code: ${actor_rollout_ref.model.trust_remote_code}
+
+algorithm:
+
+  algorithm_type: OPD
+  opd:
+    reward_coef: 0.0
+    kl_coef: 1.0
+    kl_penalty: kl
+  teacher_prompt_template:
+    default: |
+      {input}
+    context: |
+      {input}
+      Here is a student's solution to the problem:
+      {student_output}
+      Based on the student's solution, give a correct solution to the problem.
+  teacher_prompt_template_name: context

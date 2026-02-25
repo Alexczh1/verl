@@ -225,7 +225,7 @@ def apply_opd_reward(data: DataProto, opd_config: DictConfig, kl_penalty="kl"):
     alpha = opd_config.reward_coef
     beta = opd_config.kl_coef
 
-    token_level_rewards = alpha * token_level_scores - beta * kld
+    token_level_rewards = alpha * token_level_scores.sum(dim=-1) - beta * kld
 
     current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
     current_kl = torch.mean(current_kl, dim=0).item()
