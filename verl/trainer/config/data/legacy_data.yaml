@@ -13,6 +13,11 @@ train_files: ~/data/rlhf/gsm8k/train.parquet
 # Validation parquet. Can be a list or a single file.
 val_files: ~/data/rlhf/gsm8k/test.parquet
 
+# Limit number of samples used for training/validation. Null = use all.
+# E.g. set max_train_samples to 10000 to train on first 10k samples only.
+max_train_samples: null
+max_val_samples: null
+
 # The field in the dataset where the prompt is located. Default is 'prompt'.
 prompt_key: prompt
 

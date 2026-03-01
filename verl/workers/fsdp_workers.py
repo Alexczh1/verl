@@ -963,7 +963,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             if not ref_state and not self._is_lora:
                 return {}
-            
+
+
             # layer_name -> param_diffs, layer_l2_sq, layer_l1, layer_ref_l2_sq, layer_ref_l1
             layer_diffs = defaultdict(
                 lambda: {
@@ -1043,8 +1044,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 layer_diffs[layer_name]["layer_total_param_num"] += total_param_num
                 layer_diffs[layer_name]["layer_unchange_param_num"] += unchange_param_num
                 layer_diffs[layer_name]["layer_unchange_param_abs_num"] += unchange_param_abs_num
-                layer_diffs[layer_name]["layer_sparsity"] += sparsity
-                layer_diffs[layer_name]["layer_sparsity_abs"] += sparsity_abs
+                # layer_diffs[layer_name]["layer_sparsity"] += sparsity
+                # layer_diffs[layer_name]["layer_sparsity_abs"] += sparsity_abs
                 if ref_param is not None:
                     layer_diffs[layer_name]["layer_ref_l2_sq"] += ref_l2_sq
                     layer_diffs[layer_name]["layer_ref_l1"] += ref_l1

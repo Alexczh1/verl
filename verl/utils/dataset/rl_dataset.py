@@ -88,6 +88,7 @@ class RLHFDataset(Dataset):
         tokenizer: PreTrainedTokenizer,
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
+        is_train: bool = True,
     ):
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
@@ -97,6 +98,7 @@ class RLHFDataset(Dataset):
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        self.is_train = is_train
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
         self.prompt_key = config.get("prompt_key", "prompt")
@@ -126,16 +128,49 @@ class RLHFDataset(Dataset):
         data_files = self.data_files if not use_origin_parquet else self.original_data_files
         for i, parquet_file in enumerate(data_files):
             self.data_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir, use_shm=self.use_shm)
+        
+    def _normalize_reward_model_ground_truth(self, dataframe: datasets.Dataset) -> datasets.Dataset:
+        """Cast reward_model.ground_truth to string so multiple parquets can be concatenated."""
+        if "reward_model" not in dataframe.column_names:
+            return dataframe
+
+        def to_str_gt(example):
+            rm = example.get("reward_model")
+            if rm is None:
+                return {"reward_model": {"style": "", "ground_truth": ""}}
+            rm = dict(rm) if not isinstance(rm, dict) else rm
+            style = rm.get("style", "")
+            gt = rm.get("ground_truth")
+            gt = str(gt) if gt is not None else ""
+            return {"reward_model": {"style": style, "ground_truth": gt}}
+
+        dataframe = dataframe.map(to_str_gt, desc="Normalize reward_model.ground_truth to string")
+        try:
+            from datasets import Features, Value
+            new_rm = {"style": Value("string"), "ground_truth": Value("string")}
+            new_features = Features({**dataframe.features, "reward_model": new_rm})
+            dataframe = dataframe.cast(new_features)
+        except Exception:
+            pass
+        return dataframe
+
 
     def _read_files_and_tokenize(self):
         dataframes = []
         for parquet_file in self.data_files:
             # read parquet files and cache
             dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+            dataframe = self._normalize_reward_model_ground_truth(dataframe)
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
         print(f"dataset len: {len(self.dataframe)}")
+
+        max_samples = self.config.get("max_train_samples", None) if self.is_train else self.config.get("max_val_samples", None)
+        if max_samples is not None and max_samples > 0:
+            n = min(len(self.dataframe), int(max_samples))
+            self.dataframe = self.dataframe.select(range(n))
+            print(f"dataset len after max_*_samples limit: {len(self.dataframe)}")
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 

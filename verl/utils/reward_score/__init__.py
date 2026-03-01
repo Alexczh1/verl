@@ -55,7 +55,7 @@ def default_compute_score(
 
         # from . import math_verify
         # res = math_verify.compute_score(solution_str, ground_truth)
-    elif data_source == "math_dapo" or data_source.startswith("aime") or data_source.startswith("amc"):
+    elif data_source == "math_dapo" or data_source.startswith("aime") or data_source.startswith("amc") or data_source.startswith("cmimc"):
         from . import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
@@ -66,7 +66,7 @@ def default_compute_score(
         "numina_synthetic_amc",
         "numina_cn_k12",
         "numina_olympiads",
-    ]:
+    ] or "Numina" in data_source:
         from . import prime_math
 
         res = prime_math.compute_score(solution_str, ground_truth)

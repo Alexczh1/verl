@@ -7,11 +7,23 @@ defaults:
   # This file overrides or adds on top
   - _self_
 
-# Second reference model (ref2). All settings default to actor_rollout_ref; only override model.path for ref2.
-# ref2.ref points to the same ref as actor_rollout_ref.ref, so CLI overrides (e.g. ref@actor_rollout_ref.ref: megatron_ref) apply to both.
+# Second reference model (ref2). All settings default to actor_rollout_ref; only override model.path (and ref.log_prob_micro_batch_size_per_gpu) for ref2.
+# ref2.ref inherits all keys from actor_rollout_ref.ref except log_prob_micro_batch_size_per_gpu, so you can set
+# actor_rollout_ref2.ref.log_prob_micro_batch_size_per_gpu at submit time without affecting ref.
 actor_rollout_ref2:
 
-  ref: ${actor_rollout_ref.ref}
+  ref:
+    strategy: ${actor_rollout_ref.ref.strategy}
+    use_torch_compile: ${actor_rollout_ref.ref.use_torch_compile}
+    log_prob_micro_batch_size: ${actor_rollout_ref.ref.log_prob_micro_batch_size}
+    # Only key not inherited: set at submit time, e.g. actor_rollout_ref2.ref.log_prob_micro_batch_size_per_gpu=16
+    log_prob_micro_batch_size_per_gpu: null
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.ref.log_prob_use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.ref.log_prob_max_token_len_per_gpu}
+    fsdp_config: ${actor_rollout_ref.ref.fsdp_config}
+    ulysses_sequence_parallel_size: ${actor_rollout_ref.ref.ulysses_sequence_parallel_size}
+    entropy_from_logits_with_chunking: ${actor_rollout_ref.ref.entropy_from_logits_with_chunking}
+    entropy_checkpointing: ${actor_rollout_ref.ref.entropy_checkpointing}
   hybrid_engine: ${actor_rollout_ref.hybrid_engine}
   actor: ${actor_rollout_ref.actor}
   rollout: ${actor_rollout_ref.rollout}

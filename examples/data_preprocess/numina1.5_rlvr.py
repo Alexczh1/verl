@@ -66,18 +66,17 @@ def extract_solution(solution_str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--local_dir', default='/opt/tiger/verl/dataset/numina_cot')
+    parser.add_argument('--local_dir', default='/opt/tiger/verl/dataset/numina1.5_rlvr')
     parser.add_argument('--train_start', type=int, default=0)
     parser.add_argument('--train_end', type=int, default=0)
 
     args = parser.parse_args()
 
-    data_source = 'AI-MO/NuminaMath-CoT'
+    data_source = 'nlile/NuminaMath-1.5-RL-Verifiable'
     print(f"Loading the {data_source} dataset from huggingface...", flush=True)
     dataset = datasets.load_dataset(data_source, trust_remote_code=True)
 
     train_dataset = dataset['train']
-    test_dataset = dataset["test"]
 
     args.train_end = min(args.train_end, len(train_dataset))
     if args.train_end > 0:
@@ -93,7 +92,9 @@ if __name__ == '__main__':
             question = question_raw + ' ' + instruction_following
 
             answer_raw = example.pop('solution')
-            solution = extract_solution(answer_raw)
+            ground_truth = example.pop('answer')
+            answer = answer_raw + "\\boxed{" + ground_truth + "}"
+            ground_truth = str(ground_truth)
                 
             data = {
                 "data_source": data_source,
@@ -104,11 +105,11 @@ if __name__ == '__main__':
                     }
                 ],
                 "ability": "math",
-                "reward_model": {"style": "rule", "ground_truth": solution},
+                "reward_model": {"style": "rule", "ground_truth": ground_truth},
                 "extra_info": {
                     "split": split,
                     "index": idx,
-                    "answer": answer_raw,
+                    "answer": answer,
                     "question": question_raw,
                 },
             }
@@ -117,14 +118,14 @@ if __name__ == '__main__':
         return process_fn
     
 
-    train_dataset = train_dataset.map(function=make_map_fn('train'), with_indices=True)
-    test_dataset = test_dataset.map(function=make_map_fn("test"), with_indices=True)
-    
-    print(f"length of train_dataset: {len(train_dataset)}")
-    print(f"length of test_dataset: {len(test_dataset)}")
+    train_dataset = train_dataset.map(
+        function=make_map_fn('train'),
+        with_indices=True,
+        remove_columns=train_dataset.column_names,
+    )
 
+    print(f"length of train_dataset: {len(train_dataset)}")
     local_dir = args.local_dir
 
     train_dataset.to_parquet(os.path.join(local_dir, 'train.parquet'))
-    test_dataset.to_parquet(os.path.join(local_dir, 'test.parquet'))
     print(train_dataset[0])

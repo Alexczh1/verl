@@ -225,14 +225,18 @@ def apply_opd_reward(data: DataProto, opd_config: DictConfig, kl_penalty="kl"):
     alpha = opd_config.reward_coef
     beta = opd_config.kl_coef
 
-    token_level_rewards = alpha * token_level_scores.sum(dim=-1) - beta * kld
+    current_reward = token_level_scores.sum(dim=-1)
+    current_reward = torch.mean(current_reward, dim=0).item()
+
+    token_level_rewards = alpha * token_level_scores.sum(dim=-1, keepdim=True) - beta * kld
 
     current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
     current_kl = torch.mean(current_kl, dim=0).item()
 
     data.batch["token_level_rewards"] = token_level_rewards
 
-    metrics = {"actor/opd_kl_penalty": current_kl, "actor/opd_kl_coeff": beta}
+
+    metrics = {"actor/opd_kl_penalty": current_kl, "actor/opd_reward": current_reward, "actor/opd_kl_coef": beta}
 
     return data, metrics
 
@@ -437,7 +441,7 @@ class RayPPOTrainer:
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
         
-        if self.config.algorithm.algorithm_type == "opd":
+        if self.config.algorithm.get("algorithm_type", None) == "opd":
             self.opd_kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         if config.critic.enable is not None:
@@ -881,11 +885,28 @@ class RayPPOTrainer:
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
-            print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
+            extra_keys_this_batch = set()
             if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
+                for key, values in result["reward_extra_info"].items():
+                    if key not in reward_extra_infos_dict:
+                        reward_extra_infos_dict[key] = []
+                    lst = values.tolist() if isinstance(values, np.ndarray) else (values if isinstance(values, list) else [values])
+                    n_prev = len(sample_scores) - len(lst)
+                    if n_prev > 0 and len(reward_extra_infos_dict[key]) == 0:
+                        reward_extra_infos_dict[key].extend(sample_scores[:n_prev])
                     reward_extra_infos_dict[key].extend(lst)
-                    print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
+                    extra_keys_this_batch.add(key)
+            for key in list(reward_extra_infos_dict.keys()):
+                if key not in extra_keys_this_batch and len(reward_extra_infos_dict[key]) < len(sample_scores):
+                    reward_extra_infos_dict[key].extend(scores)
+            # reward_extra_info = result.get("reward_extra_info", {})
+            # for key, values in reward_extra_info.items():
+            #     if key not in reward_extra_infos_dict:
+            #         reward_extra_infos_dict[key] = []
+            #     if isinstance(values, np.ndarray):
+            #         reward_extra_infos_dict[key].extend(values.tolist())
+            #     else:
+            #         reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -1514,7 +1535,7 @@ class RayPPOTrainer:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
                         
                         # compute opd reward
-                        if self.config.algorithm.algorithm_type == "opd":
+                        if self.config.algorithm.get("algorithm_type", None) == "opd":
                             batch, opd_metrics = apply_opd_reward(
                                 batch, opd_config=self.config.algorithm.opd, kl_penalty=self.config.algorithm.opd.kl_penalty
                             )

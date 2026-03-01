@@ -26,32 +26,35 @@ from verl.utils.hdfs_io import copy, makedirs
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="~/data/retool_dapo")
+    parser.add_argument("--local_dir", default="/opt/tiger/verl/dataset/cmimc2025")
     parser.add_argument("--hdfs_dir", default=None)
 
     args = parser.parse_args()
 
-    data_path = "BytedTsinghua-SIA/DAPO-Math-17k"
+    data_path = "MathArena/cmimc_2025"
     dataset = datasets.load_dataset(data_path, "default")
+    data_source = "cmimc25"
 
     train_dataset = dataset["train"]
+
+    instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
-            orig_extra_info = example.pop("extra_info")
-            extra_info = orig_extra_info.copy()
-            extra_info["split"] = split
-            # extra_info["need_tools_kwargs"] = True
-            # extra_info["tools_kwargs"] = {
-            #     "code_interpreter": {
-            #         "create_kwargs": {
-            #             "ground_truth": example["reward_model"]["ground_truth"],
-            #         },
-            #     },
-            # }
-            example["extra_info"] = extra_info
-            return example
+            question = example.pop("problem")
+
+            question = question + " " + instruction_following
+
+            answer = example.pop("answer")
+            data = {
+                "data_source": data_source,
+                "prompt": [{"role": "user", "content": question}],
+                "ability": "math",
+                "reward_model": {"style": "rule", "ground_truth": answer},
+                "extra_info": {"split": split, "index": idx},
+            }
+            return data
 
         return process_fn
 

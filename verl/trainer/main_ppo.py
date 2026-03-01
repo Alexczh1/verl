@@ -288,13 +288,16 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
         dataset_cls = RLHFDataset
     print(f"Using dataset class: {dataset_cls.__name__}")
 
-    # Instantiate the dataset using the determined dataset class
-    dataset = dataset_cls(
+    import inspect
+    kwargs = dict(
         data_files=data_paths,
         tokenizer=tokenizer,
         processor=processor,
         config=data_config,
     )
+    if "is_train" in inspect.signature(dataset_cls.__init__).parameters:
+        kwargs["is_train"] = is_train
+    dataset = dataset_cls(**kwargs)
 
     return dataset
 

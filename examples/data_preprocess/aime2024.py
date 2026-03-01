@@ -26,14 +26,15 @@ from verl.utils.hdfs_io import copy, makedirs
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="~/data/aime2024")
+    parser.add_argument("--local_dir", default="/opt/tiger/verl/dataset/aime2025")
     parser.add_argument("--hdfs_dir", default=None)
 
     args = parser.parse_args()
 
-    data_path = "HuggingFaceH4/aime_2024"
+    # data_path = "HuggingFaceH4/aime_2024"
+    data_path = "MathArena/aime_2025"
     dataset = datasets.load_dataset(data_path, "default")
-    data_source = "aime24"
+    data_source = "aime25"
 
     train_dataset = dataset["train"]
 
