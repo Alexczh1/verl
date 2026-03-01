@@ -60,6 +60,8 @@ trainer:
   seed: 1
   save_freq: -1
   test_freq: -1
+  # Compute per-layer diff (current checkpoint vs initial model) during validation and log to tracker
+  compute_layer_diff_during_validation: True
   nnodes: 1
   n_gpus_per_node: 8
   max_ckpt_to_keep: null  # Maximum number of checkpoints to keep, set to null to keep all

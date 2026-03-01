@@ -50,12 +50,14 @@ from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 from verl.utils.distributed import destroy_global_process_group, initialize_global_process_group
 from verl.utils.fs import copy_to_local
+from verl.utils.checkpoint.compare_layers import compute_layer_diffs
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
     apply_fsdp2,
     fsdp2_clip_grad_norm_,
     fsdp2_load_full_state_dict,
+    get_fsdp_full_state_dict,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     init_fn,
@@ -280,7 +282,12 @@ class FSDPSFTTrainer:
             cpu_offload = CPUOffload(offload_params=self.config.model.fsdp_config.offload_params)
 
         fsdp_strategy = self.config.model.strategy
+        self.initial_model_state_dict = None
         if fsdp_strategy == "fsdp":
+            if self.device_mesh.get_rank() == 0:
+                self.initial_model_state_dict = {
+                    k: v.cpu().clone() for k, v in self.model.state_dict().items()
+                }
             self.fsdp_model = FSDP(
                 self.model,
                 cpu_offload=cpu_offload,
@@ -307,6 +314,10 @@ class FSDPSFTTrainer:
                 "reshard_after_forward": True,
             }
             full_state = self.model.state_dict()
+            if self.device_mesh.get_rank() == 0:
+                self.initial_model_state_dict = {
+                    k: v.cpu().clone() for k, v in full_state.items()
+                }
             apply_fsdp2(self.model, fsdp_kwargs, self.config.model.fsdp_config)
             fsdp2_load_full_state_dict(self.model, full_state, self.device_mesh, cpu_offload)
             self.fsdp_model = self.model
@@ -747,11 +758,47 @@ class FSDPSFTTrainer:
                         )
                         val_loss = self.validation_step(val_data)
                         val_losses.append(val_loss)
+                    # All ranks participate in gathering full state dict for layer-diff (collective)
+                    current_state = get_fsdp_full_state_dict(
+                        self.fsdp_model, offload_to_cpu=True, rank0_only=True
+                    )
                     if rank == 0:
                         val_loss = torch.mean(torch.stack(val_losses))
                         metric = {"val/loss": val_loss.detach().item()}
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
+                        # Per-layer diff: current checkpoint vs initial model
+                        if getattr(
+                            self.config.trainer, "compute_layer_diff_during_validation", True
+                        ) and getattr(self, "initial_model_state_dict", None) is not None:
+                            try:
+                                layer_diff_result = compute_layer_diffs(
+                                    current_state,
+                                    self.initial_model_state_dict,
+                                    only_parameters=True,
+                                    normalize_keys=True,
+                                )
+                                tracking.log(
+                                    data={
+                                        "val/ckpt_vs_init_total_l2": layer_diff_result["total_layer_l2"],
+                                        "val/ckpt_vs_init_total_ratio_l2": layer_diff_result.get(
+                                            "total_ratio_l2"
+                                        ),
+                                        "val/ckpt_vs_init_total_sparsity_abs": layer_diff_result[
+                                            "total_sparsity_abs"
+                                        ],
+                                    },
+                                    step=global_step,
+                                )
+                                logger.info(
+                                    "val ckpt vs init: total_l2=%.6f ratio_l2=%s sparsity_abs=%.4f",
+                                    layer_diff_result["total_layer_l2"],
+                                    layer_diff_result.get("total_ratio_l2"),
+                                    layer_diff_result["total_sparsity_abs"],
+                                )
+                            except Exception as e:
+                                logger.warning("compute_layer_diffs failed: %s", e)
+                        del current_state
                     torch.distributed.barrier()
 
                 if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
