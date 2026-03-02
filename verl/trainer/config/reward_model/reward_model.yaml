@@ -49,6 +49,15 @@ forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
 # the reward manager can be set to prime for parallel verification.
 reward_manager: naive
 
+# DAPO only: length penalty when response exceeds (max_response_length - len). null = no penalty.
+overlong_buffer: null
+# When not null, use e.g.:
+# overlong_buffer:
+#   enable: True
+#   len: 4096
+#   penalty_factor: 1.0
+#   log: False
+
 # Whether to launch custom reward function asynchronously during log_prob
 # custom reward function executed async on CPU, during log_prob
 launch_reward_fn_async: False

@@ -213,12 +213,14 @@ class TaskRunner:
             mapping[Role.Ref2Policy] = global_pool_id
 
         # Load the reward manager for training and validation.
-        reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
-        )
-        val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
-        )
+        reward_kwargs = dict(config.reward_model.get("reward_kwargs", {}))
+        if config.reward_model.get("reward_manager") == "dapo":
+            if "max_resp_len" not in reward_kwargs:
+                reward_kwargs["max_resp_len"] = config.data.get("max_response_length")
+            if "overlong_buffer_cfg" not in reward_kwargs:
+                reward_kwargs["overlong_buffer_cfg"] = config.reward_model.get("overlong_buffer")
+        reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **reward_kwargs)
+        val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **reward_kwargs)
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
         from verl.utils.dataset.rl_dataset import collate_fn

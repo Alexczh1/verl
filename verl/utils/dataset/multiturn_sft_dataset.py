@@ -83,11 +83,22 @@ class MultiTurnSFTDataset(Dataset):
                 ls = ls[0]
             return ls
 
+        def _load_file(path: str) -> pd.DataFrame:
+            path_lower = path.lower()
+            if path_lower.endswith(".jsonl") or path_lower.endswith(".jsonl.gz"):
+                return pd.read_json(path, lines=True)
+            return pd.read_parquet(path)
+
         dataframes = []
         for parquet_file in self.parquet_files:
-            dataframe = pd.read_parquet(parquet_file)
+            dataframe = _load_file(parquet_file)
             dataframes.append(dataframe)
         self.dataframe = pd.concat(dataframes)
+        max_samples = config.get("max_samples", None) if config else None
+        if max_samples is not None and max_samples > 0:
+            n = min(len(self.dataframe), int(max_samples))
+            self.dataframe = self.dataframe.iloc[:n]
+            print(f"sft multiturn dataset len after max_samples limit: {len(self.dataframe)}")
 
         # Extract messages list from dataframe
         self.messages = self.dataframe[self.messages_key].apply(series_to_item).tolist()

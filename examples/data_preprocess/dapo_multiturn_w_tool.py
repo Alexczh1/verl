@@ -26,13 +26,13 @@ from verl.utils.hdfs_io import copy, makedirs
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="~/data/retool_dapo")
+    parser.add_argument("--local_dir", default="/opt/tiger/verl/dataset/math_dapo")
     parser.add_argument("--hdfs_dir", default=None)
 
     args = parser.parse_args()
 
-    data_path = "BytedTsinghua-SIA/DAPO-Math-17k"
-    dataset = datasets.load_dataset(data_path, "default")
+    data_path = "open-r1/DAPO-Math-17k-Processed"
+    dataset = datasets.load_dataset(data_path, "en")
 
     train_dataset = dataset["train"]
 
@@ -65,3 +65,4 @@ if __name__ == "__main__":
     if hdfs_dir is not None:
         makedirs(hdfs_dir)
         copy(src=local_dir, dst=hdfs_dir)
+    print("length of train dataset: ", len(train_dataset))

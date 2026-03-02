@@ -115,12 +115,17 @@ class RLHFDataset(Dataset):
         self.use_shm = config.get("use_shm", False)
         self.chat_template_func = config.get("chat_template_func", None)
         self.need_tools_kwargs = config.get("need_tools_kwargs", False)
+        self.enable_thinking = config.get("enable_thinking", None)
         self.filter_prompts = config.get("filter_prompts", True)
         self.serialize_dataset = False
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
 
         self._download()
         self._read_files_and_tokenize()
+
+    def _chat_template_kwargs(self):
+        """Kwargs for apply_chat_template (e.g. enable_thinking for Qwen)."""
+        return {"enable_thinking": self.enable_thinking} if self.enable_thinking is not None else {}
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -156,10 +161,15 @@ class RLHFDataset(Dataset):
 
 
     def _read_files_and_tokenize(self):
+        def _load_file(path: str) -> datasets.Dataset:
+            path_lower = path.lower()
+            if path_lower.endswith(".jsonl") or path_lower.endswith(".jsonl.gz"):
+                return datasets.load_dataset("json", data_files=path, split="train")
+            return datasets.load_dataset("parquet", data_files=path)["train"]
+
         dataframes = []
-        for parquet_file in self.data_files:
-            # read parquet files and cache
-            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+        for data_file in self.data_files:
+            dataframe = _load_file(data_file)
             dataframe = self._normalize_reward_model_ground_truth(dataframe)
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
@@ -189,7 +199,7 @@ class RLHFDataset(Dataset):
                 def doc2len(doc) -> int:
                     messages = self._build_messages(doc)
                     raw_prompt = self.processor.apply_chat_template(
-                        messages, add_generation_prompt=True, tokenize=False
+                        messages, add_generation_prompt=True, tokenize=False, **self._chat_template_kwargs()
                     )
                     images = [process_image(image) for image in doc[image_key]] if image_key in doc else None
                     videos = [process_video(video) for video in doc[video_key]] if video_key in doc else None
@@ -199,7 +209,7 @@ class RLHFDataset(Dataset):
             else:
 
                 def doc2len(doc) -> int:
-                    return len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True))
+                    return len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True, **self._chat_template_kwargs()))
 
             dataframe = dataframe.filter(
                 lambda doc: doc2len(doc) <= self.max_prompt_length,
@@ -254,7 +264,9 @@ class RLHFDataset(Dataset):
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
 
-            raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            raw_prompt = self.processor.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False, **self._chat_template_kwargs()
+            )
             multi_modal_data = {}
 
             images = None
@@ -293,7 +305,9 @@ class RLHFDataset(Dataset):
                 row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
 
         else:
-            raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            raw_prompt = self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False, **self._chat_template_kwargs()
+            )
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")

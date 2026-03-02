@@ -176,9 +176,14 @@ def is_correct_minerva(
     Returns:
         Tuple of (is_correct, normalized_prediction)
     """
-    # Extract answer from solution
+    # Extract answer from solution (Minerva "Answer: ..." pattern)
     match = re.findall(answer_pattern, solution_str)
-    extracted_answer = match[-1] if match else "[INVALID]"
+    if match:
+        extracted_answer = match[-1]
+    else:
+        # Fallback: use last \boxed{...} if no "Answer:" (e.g. model only outputs "$$ \\boxed{277} $$")
+        boxed = last_boxed_only_string(solution_str)
+        extracted_answer = remove_boxed(boxed) if boxed else "[INVALID]"
     pred = normalize_final_answer(extracted_answer)
 
     # Process ground truth

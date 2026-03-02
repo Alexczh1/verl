@@ -183,7 +183,7 @@ class FSDPSFTTrainer:
         )
 
         self.val_sampler = DistributedSampler(
-            self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True
+            self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=False
         )
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
@@ -763,7 +763,9 @@ class FSDPSFTTrainer:
                         self.fsdp_model, offload_to_cpu=True, rank0_only=True
                     )
                     if rank == 0:
-                        val_loss = torch.mean(torch.stack(val_losses))
+                        if not val_loss:
+                            import pdb; pdb.set_trace()
+                        val_loss = torch.mean(torch.stack(val_losses)) if val_losses else torch.tensor(float("nan"))
                         metric = {"val/loss": val_loss.detach().item()}
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
@@ -826,8 +828,12 @@ def run_sft(config):
 
     local_model_path = copy_to_local(src=config.model.partial_pretrain, verbose=True)
     tokenizer = hf_tokenizer(local_model_path, trust_remote_code=config.model.trust_remote_code)
-    train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
-    val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
+    train_dataset = create_sft_dataset(
+        config.data.train_files, config.data, tokenizer, is_train=True
+    )
+    val_dataset = create_sft_dataset(
+        config.data.val_files, config.data, tokenizer, is_train=False
+    )
 
     trainer = FSDPSFTTrainer(
         config=config,
@@ -848,8 +854,21 @@ def main(config):
     run_sft(config)
 
 
-def create_sft_dataset(data_paths, data_config, tokenizer):
-    """Create a dataset."""
+def create_sft_dataset(data_paths, data_config, tokenizer, is_train=None):
+    """Create a dataset. When is_train is True/False, max_train_samples/max_val_samples are applied via config.max_samples."""
+    from omegaconf import OmegaConf
+
+    # Inject max_samples so dataset can limit size (train vs val). Build a new config dict to avoid struct mode.
+    if is_train is True:
+        max_samples = data_config.get("max_train_samples", None)
+    elif is_train is False:
+        max_samples = data_config.get("max_val_samples", None)
+    else:
+        max_samples = None
+    config_dict = OmegaConf.to_container(data_config, resolve=True)
+    config_dict["max_samples"] = max_samples
+    config_for_dataset = OmegaConf.create(config_dict)
+
     # build dataset
     # First check if a custom dataset class is specified
     if data_config.custom_cls.get("path", None):
@@ -864,7 +883,7 @@ def create_sft_dataset(data_paths, data_config, tokenizer):
         dataset_cls = SFTDataset
 
     # Create datasets based on the selected class
-    dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config)
+    dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=config_for_dataset)
     return dataset
 
 
